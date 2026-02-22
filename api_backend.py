@@ -1,23 +1,24 @@
 """
-FastAPI Backend v3.0 - Enhanced with Volatility Analysis
-Added: Regime Indicator, IV vs RV Comparison, Current Market Signal on Backtest
+NIFTY Trading System - COMPLETE Backend v5.0
+ALL ENDPOINTS: Old + New + Strategy Comparison
+Ready for ML Integration
 """
 
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import pandas as pd
 import numpy as np
 from datetime import datetime
-from typing import Optional
+from typing import Optional, Literal
 
 app = FastAPI(
-    title="NIFTY Straddle Scalping API",
-    description="AI-Powered Options Trading System with Volatility Analysis",
-    version="3.0.0"
+    title="NIFTY Multi-Strategy Trading System",
+    description="Rule-Based + Gamma Scalping + ML Ready",
+    version="5.0.0"
 )
 
-# CORS Configuration
+# CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -26,28 +27,51 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Global variables for data caching
+# Global data
 performance_df = None
 trades_df = None
 signals_df = None
 straddle_df = None
 
-# Load data on startup
+# Strategy-specific data
+gamma_performance = None
+gamma_trades = None
+hybrid_performance = None
+hybrid_trades = None
+
+
 @app.on_event("startup")
 async def load_data():
     global performance_df, trades_df, signals_df, straddle_df
+    global gamma_performance, gamma_trades, hybrid_performance, hybrid_trades
+    
     try:
+        # Load IV scalping data (original)
         performance_df = pd.read_csv("performance_metrics.csv")
         trades_df = pd.read_csv("backtest_results.csv")
         signals_df = pd.read_csv("trading_signals.csv")
         signals_df["datetime"] = pd.to_datetime(signals_df["datetime"])
         straddle_df = pd.read_csv("straddle_data_prepared.csv")
         straddle_df["datetime"] = pd.to_datetime(straddle_df["datetime"])
-        print("✅ All data loaded successfully!")
-        print(f"   - Performance metrics: {len(performance_df)} rows")
-        print(f"   - Trades: {len(trades_df)} rows")
-        print(f"   - Signals: {len(signals_df)} rows")
-        print(f"   - Straddle data: {len(straddle_df)} rows")
+        
+        # Load Gamma scalping data
+        try:
+            gamma_perf_df = pd.read_csv("gamma_performance_metrics.csv")
+            gamma_performance = gamma_perf_df.iloc[0].to_dict()
+            gamma_trades = pd.read_csv("gamma_backtest_results.csv")
+        except:
+            print("⚠️ Gamma data not found")
+        
+        # Load Hybrid data
+        try:
+            hybrid_perf_df = pd.read_csv("hybrid_performance_metrics.csv")
+            hybrid_performance = hybrid_perf_df.iloc[0].to_dict()
+            hybrid_trades = pd.read_csv("hybrid_backtest_results.csv")
+        except:
+            print("⚠️ Hybrid data not found")
+        
+        print("✅ Data loaded successfully!")
+        
     except Exception as e:
         print(f"⚠️ Error loading data: {e}")
 
@@ -60,14 +84,12 @@ class BacktestParams(BaseModel):
 
 
 def calculate_realized_volatility(spot_prices, window=20):
-    """Calculate realized volatility from spot prices"""
     returns = np.log(spot_prices / spot_prices.shift(1))
     realized_vol = returns.rolling(window=window).std() * np.sqrt(252) * 100
     return realized_vol
 
 
 def get_volatility_regime(current_iv, recent_ivs):
-    """Determine if we're in LOW/NORMAL/HIGH volatility regime"""
     avg = recent_ivs.mean()
     std = recent_ivs.std()
     
@@ -78,11 +100,11 @@ def get_volatility_regime(current_iv, recent_ivs):
     elif current_iv > (avg + 0.5 * std):
         regime = "HIGH"
         color = "red"
-        description = "Options are expensive - avoid entry"
+        description = "Options are expensive"
     else:
         regime = "NORMAL"
         color = "yellow"
-        description = "Neutral market conditions"
+        description = "Neutral conditions"
     
     deviation_pct = ((current_iv - avg) / avg) * 100
     
@@ -96,55 +118,88 @@ def get_volatility_regime(current_iv, recent_ivs):
     }
 
 
-def calculate_current_signal(current_row, params, lookback_data):
-    """Calculate what signal would be generated NOW with given parameters"""
-    current_iv = current_row['avg_iv']
+def calculate_greeks_simple(spot, strike, time_to_expiry, iv):
+    T = time_to_expiry
+    sigma = iv / 100
     
-    # Calculate IV percentile with new params
-    recent_ivs = lookback_data['avg_iv'].tail(100)
-    threshold_value = np.percentile(recent_ivs, params.iv_entry_percentile)
+    if T <= 0:
+        return {'delta': 0, 'gamma': 0, 'vega': 0, 'theta': 0}
     
-    if current_iv <= threshold_value:
-        percentile = params.iv_entry_percentile
-        signal = "BUY"
-        reasoning = f"Current IV ({current_iv:.1f}%) is at {percentile}th percentile or below - IN ENTRY ZONE!"
-    else:
-        actual_percentile = (recent_ivs <= current_iv).sum() / len(recent_ivs) * 100
-        signal = "HOLD"
-        reasoning = f"Current IV ({current_iv:.1f}%) is at {actual_percentile:.0f}th percentile - WAIT for lower IV"
+    # ATM approximations
+    gamma = 0.4 / (spot * sigma * np.sqrt(T))
+    vega = spot * 0.4 * np.sqrt(T)
+    theta = -(spot * sigma * 0.4) / (2 * np.sqrt(T)) / 365
     
     return {
-        "action": signal,
-        "reasoning": reasoning,
-        "current_iv": round(current_iv, 2),
-        "entry_threshold": round(threshold_value, 2),
-        "straddle_cost": round(current_row['straddle_cost'], 2)
+        'delta': 0.02,  # Near 0 for ATM straddle
+        'gamma': gamma * 2,
+        'vega': vega * 2,
+        'theta': theta * 2
     }
 
 
+def calculate_confidence(iv_percentile: float) -> int:
+    if iv_percentile <= 20:
+        return 85
+    elif iv_percentile <= 25:
+        return 80
+    elif iv_percentile <= 30:
+        return 70
+    elif iv_percentile <= 35:
+        return 60
+    elif iv_percentile <= 40:
+        return 50
+    else:
+        return max(20, int(100 - iv_percentile))
+
+
+# ============ ROOT & INFO ENDPOINTS ============
+
 @app.get("/")
 def root():
-    """API root endpoint"""
     return {
-        "message": "NIFTY Straddle Scalping API",
-        "status": "running",
-        "version": "3.0.0",
-        "new_features": [
-            "Volatility Regime Indicator",
-            "IV vs RV Comparison",
-            "Current Market Signal on Backtest"
-        ],
+        "message": "NIFTY Multi-Strategy Trading System",
+        "version": "5.0.0",
+        "strategies": {
+            "iv_scalping": "Volatility-based scalping (Original)",
+            "gamma_scalping": "Greeks-based delta hedging (NEW)",
+            "hybrid": "Combined IV + Gamma (NEW)",
+            "ml_prediction": "ML-based volatility prediction (COMING SOON)"
+        },
         "endpoints": {
-            "/current-signal": "Get latest trading signal with regime",
-            "/volatility-analysis": "Get IV vs RV comparison (NEW)",
-            "/run-backtest": "Run backtest with current market signal (ENHANCED)"
+            "/current-signal": "Latest trading signal",
+            "/performance": "Overall performance",
+            "/trades/recent": "Recent 10 trades",
+            "/iv-history": "IV history for charts",
+            "/pnl-curve": "Cumulative P&L",
+            "/run-backtest": "Custom backtest",
+            "/strategies": "List all strategies",
+            "/strategy/{name}/performance": "Strategy performance",
+            "/strategy/compare": "Compare strategies",
+            "/greeks": "Current Greeks",
+            "/volatility-analysis": "IV vs RV"
         }
     }
 
 
+@app.get("/health")
+def health_check():
+    return {
+        "status": "healthy",
+        "timestamp": datetime.now().isoformat(),
+        "data_loaded": all([
+            performance_df is not None,
+            trades_df is not None,
+            signals_df is not None,
+            straddle_df is not None
+        ])
+    }
+
+
+# ============ LEGACY ENDPOINTS (Original System) ============
+
 @app.get("/current-signal")
 def get_current_signal():
-    """Get the latest trading signal with volatility regime"""
     if signals_df is None:
         return {"error": "Data not loaded"}
 
@@ -154,7 +209,6 @@ def get_current_signal():
         current_iv = float(last["iv"])
         iv_percentile = float((recent["iv"] <= current_iv).sum() / len(recent) * 100)
         
-        # NEW: Calculate volatility regime
         regime_info = get_volatility_regime(current_iv, recent["iv"])
 
         return {
@@ -167,75 +221,14 @@ def get_current_signal():
             "recommendation": get_recommendation(str(last["signal"]), current_iv, iv_percentile),
             "in_position": bool(last["in_position"]),
             "confidence": calculate_confidence(iv_percentile),
-            "volatility_regime": regime_info  # NEW
+            "volatility_regime": regime_info
         }
     except Exception as e:
-        return {"error": f"Error processing signal: {str(e)}"}
-
-
-@app.get("/volatility-analysis")
-def get_volatility_analysis(periods: int = Query(50, description="Number of periods")):
-    """Get IV vs RV comparison analysis - NEW ENDPOINT"""
-    if straddle_df is None:
-        return {"error": "Data not loaded"}
-    
-    try:
-        recent = straddle_df.tail(periods + 20).copy()  # Extra for RV calculation
-        
-        # Calculate Realized Volatility
-        recent['realized_vol'] = calculate_realized_volatility(recent['spot'], window=20)
-        
-        # Get data points for chart
-        data = []
-        for _, row in recent.tail(periods).iterrows():
-            if pd.notna(row['realized_vol']):
-                data.append({
-                    "timestamp": str(row['datetime']),
-                    "implied_vol": round(float(row['avg_iv']), 2),
-                    "realized_vol": round(float(row['realized_vol']), 2),
-                    "iv_rv_ratio": round(float(row['avg_iv'] / row['realized_vol']), 2)
-                })
-        
-        # Current values
-        current = recent.iloc[-1]
-        current_iv = float(current['avg_iv'])
-        current_rv = float(current['realized_vol']) if pd.notna(current['realized_vol']) else current_iv
-        iv_rv_ratio = current_iv / current_rv
-        
-        # Determine if options are cheap or expensive
-        if iv_rv_ratio < 0.9:
-            assessment = "CHEAP"
-            color = "green"
-            message = "Options are cheaper than historical movement suggests - good buying opportunity!"
-        elif iv_rv_ratio > 1.2:
-            assessment = "EXPENSIVE"
-            color = "red"
-            message = "Options are more expensive than warranted by actual movement - avoid buying!"
-        else:
-            assessment = "FAIR"
-            color = "yellow"
-            message = "Options are fairly priced relative to realized volatility."
-        
-        return {
-            "current": {
-                "implied_vol": round(current_iv, 2),
-                "realized_vol": round(current_rv, 2),
-                "iv_rv_ratio": round(iv_rv_ratio, 2),
-                "assessment": assessment,
-                "color": color,
-                "message": message
-            },
-            "periods": len(data),
-            "data": data
-        }
-    
-    except Exception as e:
-        return {"error": f"Error calculating volatility analysis: {str(e)}"}
+        return {"error": f"Error: {str(e)}"}
 
 
 @app.get("/performance")
 def get_performance():
-    """Get overall performance metrics"""
     if performance_df is None:
         return {"error": "Data not loaded"}
 
@@ -255,41 +248,51 @@ def get_performance():
             "profit_factor": round(float(p["profit_factor"]), 2)
         }
     except Exception as e:
-        return {"error": f"Error processing performance: {str(e)}"}
+        return {"error": f"Error: {str(e)}"}
 
 
-@app.get("/trades")
-def get_all_trades(
-    limit: int = Query(1000, description="Maximum number of trades to return"),
-    filter: str = Query("ALL", description="Filter by result: ALL, WIN, or LOSS")
-):
-    """Get all trades with optional filtering"""
+@app.get("/trades/recent")
+def get_recent_trades():
     if trades_df is None:
         return {"error": "Data not loaded"}
 
     try:
-        # Find result column
+        recent = trades_df.tail(10).copy()
+        numeric_cols = recent.select_dtypes(include=[np.number]).columns
+        for col in numeric_cols:
+            recent[col] = recent[col].round(2)
+
+        return {
+            "count": len(recent),
+            "trades": recent.fillna("").to_dict("records")
+        }
+    except Exception as e:
+        return {"error": f"Error: {str(e)}"}
+
+
+@app.get("/trades")
+def get_all_trades(
+    limit: int = Query(1000, description="Max trades"),
+    filter: str = Query("ALL", description="ALL, WIN, or LOSS")
+):
+    if trades_df is None:
+        return {"error": "Data not loaded"}
+
+    try:
         result_col = None
-        for col in ["Result", "result", "RESULT", "Trade Result"]:
+        for col in ["Result", "result", "RESULT"]:
             if col in trades_df.columns:
                 result_col = col
                 break
         
-        if result_col is None:
-            return {"error": "Result column not found in trades data"}
-        
-        # Apply filter
-        if filter.upper() == "WIN":
+        if result_col and filter.upper() == "WIN":
             filtered = trades_df[trades_df[result_col] == "WIN"].copy()
-        elif filter.upper() == "LOSS":
+        elif result_col and filter.upper() == "LOSS":
             filtered = trades_df[trades_df[result_col] == "LOSS"].copy()
         else:
             filtered = trades_df.copy()
 
-        # Apply limit
         trades_list = filtered.head(limit).copy()
-
-        # Round numeric columns
         numeric_cols = trades_list.select_dtypes(include=[np.number]).columns
         for col in numeric_cols:
             trades_list[col] = trades_list[col].round(2)
@@ -301,34 +304,11 @@ def get_all_trades(
             "trades": trades_list.fillna("").to_dict("records")
         }
     except Exception as e:
-        return {"error": f"Error processing trades: {str(e)}"}
-
-
-@app.get("/trades/recent")
-def get_recent_trades():
-    """Get 10 most recent trades"""
-    if trades_df is None:
-        return {"error": "Data not loaded"}
-
-    try:
-        recent = trades_df.tail(10).copy()
-
-        # Round numeric columns
-        numeric_cols = recent.select_dtypes(include=[np.number]).columns
-        for col in numeric_cols:
-            recent[col] = recent[col].round(2)
-
-        return {
-            "count": len(recent),
-            "trades": recent.fillna("").to_dict("records")
-        }
-    except Exception as e:
-        return {"error": f"Error processing recent trades: {str(e)}"}
+        return {"error": f"Error: {str(e)}"}
 
 
 @app.get("/iv-history")
-def get_iv_history(periods: int = Query(50, description="Number of periods to return")):
-    """Get IV history for charting"""
+def get_iv_history(periods: int = Query(50, description="Number of periods")):
     if signals_df is None:
         return {"error": "Data not loaded"}
 
@@ -343,25 +323,20 @@ def get_iv_history(periods: int = Query(50, description="Number of periods to re
             for _, row in recent.iterrows()
         ]
 
-        return {
-            "periods": len(data),
-            "data": data
-        }
+        return {"periods": len(data), "data": data}
     except Exception as e:
-        return {"error": f"Error processing IV history: {str(e)}"}
+        return {"error": f"Error: {str(e)}"}
 
 
 @app.get("/pnl-curve")
 def get_pnl_curve():
-    """Get cumulative P&L curve"""
     if trades_df is None:
         return {"error": "Data not loaded"}
 
     try:
         data = []
         cumulative = 0
-
-        # Find the P&L column
+        
         pnl_col = None
         for col in ["pnl", "P&L (₹)", "P&L"]:
             if col in trades_df.columns:
@@ -385,32 +360,26 @@ def get_pnl_curve():
             "data": data
         }
     except Exception as e:
-        return {"error": f"Error processing P&L curve: {str(e)}"}
+        return {"error": f"Error: {str(e)}"}
 
 
 @app.post("/run-backtest")
 def run_custom_backtest(params: BacktestParams):
-    """Run backtest with custom parameters + current market signal - ENHANCED"""
     if straddle_df is None:
-        return {"error": "Straddle data not loaded"}
+        return {"error": "Data not loaded"}
 
     try:
-        # Parameters
         LOOKBACK = 100
         IV_ENTRY = params.iv_entry_percentile
         PROFIT_TARGET = params.profit_target
         STOP_LOSS = params.stop_loss
         MAX_HOLD = int(params.max_hold_time / 5)
 
-        # Copy data
         df = straddle_df.copy()
-
-        # Calculate IV percentile
         df["iv_percentile"] = df["avg_iv"].rolling(window=LOOKBACK, min_periods=20).apply(
             lambda x: (x.iloc[-1] <= np.percentile(x, IV_ENTRY)) * 100 if len(x) > 0 else 0
         )
 
-        # Simulate trading
         trades = []
         position = None
 
@@ -436,7 +405,6 @@ def run_custom_backtest(params: BacktestParams):
                 if exit:
                     trades.append({
                         "pnl": pnl,
-                        "pnl_pct": pnl_pct,
                         "result": "WIN" if pnl > 0 else "LOSS"
                     })
                     position = None
@@ -447,17 +415,8 @@ def run_custom_backtest(params: BacktestParams):
                         "entry_cost": current_cost
                     }
 
-        # Calculate metrics
         if len(trades) == 0:
-            return {
-                "total_trades": 0,
-                "win_rate": 0,
-                "total_pnl": 0,
-                "profit_factor": 0,
-                "sharpe_ratio": 0,
-                "message": "No trades generated with these parameters",
-                "current_market_signal": None
-            }
+            return {"total_trades": 0, "message": "No trades generated"}
 
         trades_df_new = pd.DataFrame(trades)
         total_trades = len(trades_df_new)
@@ -471,10 +430,6 @@ def run_custom_backtest(params: BacktestParams):
 
         sharpe = (trades_df_new["pnl"].mean() / trades_df_new["pnl"].std()) if trades_df_new["pnl"].std() > 0 else 0
 
-        # NEW: Calculate current market signal with these parameters
-        current_row = df.iloc[-1]
-        current_signal = calculate_current_signal(current_row, params, df)
-
         return {
             "total_trades": total_trades,
             "winning_trades": winning_trades,
@@ -483,50 +438,206 @@ def run_custom_backtest(params: BacktestParams):
             "total_pnl": round(total_pnl, 2),
             "profit_factor": round(profit_factor, 2),
             "sharpe_ratio": round(sharpe, 2),
-            "avg_pnl": round(trades_df_new["pnl"].mean(), 2),
-            "parameters": {
-                "iv_entry_percentile": IV_ENTRY,
-                "profit_target": PROFIT_TARGET,
-                "stop_loss": STOP_LOSS,
-                "max_hold_time": params.max_hold_time
-            },
-            "current_market_signal": current_signal  # NEW
+            "avg_pnl": round(trades_df_new["pnl"].mean(), 2)
         }
 
     except Exception as e:
         return {"error": f"Backtest failed: {str(e)}"}
 
 
+# ============ NEW ENDPOINTS (Multi-Strategy) ============
+
+@app.get("/strategies")
+def list_strategies():
+    return {
+        "strategies": [
+            {
+                "id": "iv_scalping",
+                "name": "IV Scalping",
+                "description": "Rule-based volatility scalping",
+                "type": "Volatility-based",
+                "status": "production"
+            },
+            {
+                "id": "gamma_scalping",
+                "name": "Gamma Scalping",
+                "description": "Greeks-based delta hedging",
+                "type": "Greeks-based",
+                "status": "theoretical"
+            },
+            {
+                "id": "hybrid",
+                "name": "Hybrid (IV + Gamma)",
+                "description": "Combined approach",
+                "type": "Combined",
+                "status": "development"
+            }
+        ]
+    }
+
+
+@app.get("/strategy/{strategy_name}/performance")
+def get_strategy_performance(strategy_name: str):
+    if strategy_name == "iv_scalping":
+        return get_performance()
+    
+    elif strategy_name == "gamma_scalping":
+        if gamma_performance:
+            return {
+                "strategy": "gamma_scalping",
+                "total_trades": int(gamma_performance.get('total_trades', 0)),
+                "win_rate": round(float(gamma_performance.get('win_rate', 0)), 1),
+                "total_pnl": round(float(gamma_performance.get('total_pnl', 0)), 2),
+                "profit_factor": round(float(gamma_performance.get('profit_factor', 0)), 2)
+            }
+        return {"status": "not_computed", "message": "Run backtest to generate data"}
+    
+    elif strategy_name == "hybrid":
+        if hybrid_performance:
+            return {
+                "strategy": "hybrid",
+                "total_trades": int(hybrid_performance.get('total_trades', 0)),
+                "win_rate": round(float(hybrid_performance.get('win_rate', 0)), 1),
+                "total_pnl": round(float(hybrid_performance.get('total_pnl', 0)), 2),
+                "profit_factor": round(float(hybrid_performance.get('profit_factor', 0)), 2)
+            }
+        return {"status": "not_computed", "message": "Run backtest to generate data"}
+
+
+@app.get("/strategy/compare")
+def compare_strategies():
+    strategies = []
+    
+    # IV Scalping
+    if performance_df is not None:
+        p = performance_df.iloc[0]
+        strategies.append({
+            "name": "iv_scalping",
+            "total_trades": int(p["total_trades"]),
+            "win_rate": round(float(p["win_rate"]), 1),
+            "total_pnl": round(float(p["total_pnl"]), 2),
+            "profit_factor": round(float(p["profit_factor"]), 2)
+        })
+    
+    # Gamma Scalping
+    if gamma_performance:
+        strategies.append({
+            "name": "gamma_scalping",
+            "total_trades": int(gamma_performance['total_trades']),
+            "win_rate": round(float(gamma_performance['win_rate']), 1),
+            "total_pnl": round(float(gamma_performance['total_pnl']), 2),
+            "profit_factor": round(float(gamma_performance['profit_factor']), 2)
+        })
+    else:
+        strategies.append({
+            "name": "gamma_scalping",
+            "status": "not_computed"
+        })
+    
+    # Hybrid
+    if hybrid_performance:
+        strategies.append({
+            "name": "hybrid",
+            "total_trades": int(hybrid_performance['total_trades']),
+            "win_rate": round(float(hybrid_performance['win_rate']), 1),
+            "total_pnl": round(float(hybrid_performance['total_pnl']), 2),
+            "profit_factor": round(float(hybrid_performance['profit_factor']), 2)
+        })
+    else:
+        strategies.append({
+            "name": "hybrid",
+            "status": "not_computed"
+        })
+    
+    return {"strategies": strategies}
+
+
+@app.get("/greeks")
+def get_current_greeks():
+    if straddle_df is None:
+        return {"error": "Data not loaded"}
+    
+    try:
+        last = straddle_df.iloc[-1]
+        spot = float(last['spot'])
+        iv = float(last['avg_iv'])
+        
+        greeks = calculate_greeks_simple(spot, spot, 7/365, iv)
+        
+        return {
+            "timestamp": str(last['datetime']),
+            "spot": round(spot, 2),
+            "current_iv": round(iv, 2),
+            "greeks": {
+                "delta": round(greeks['delta'], 3),
+                "gamma": round(greeks['gamma'], 4),
+                "vega": round(greeks['vega'], 2),
+                "theta": round(greeks['theta'], 2)
+            }
+        }
+    except Exception as e:
+        return {"error": f"Error: {str(e)}"}
+
+
+@app.get("/volatility-analysis")
+def get_volatility_analysis(periods: int = Query(50, description="Number of periods")):
+    if straddle_df is None:
+        return {"error": "Data not loaded"}
+    
+    try:
+        recent = straddle_df.tail(periods + 20).copy()
+        recent['realized_vol'] = calculate_realized_volatility(recent['spot'], window=20)
+        
+        data = []
+        for _, row in recent.tail(periods).iterrows():
+            if pd.notna(row['realized_vol']):
+                data.append({
+                    "timestamp": str(row['datetime']),
+                    "implied_vol": round(float(row['avg_iv']), 2),
+                    "realized_vol": round(float(row['realized_vol']), 2),
+                    "iv_rv_ratio": round(float(row['avg_iv'] / row['realized_vol']), 2)
+                })
+        
+        current = recent.iloc[-1]
+        current_iv = float(current['avg_iv'])
+        current_rv = float(current['realized_vol']) if pd.notna(current['realized_vol']) else current_iv
+        iv_rv_ratio = current_iv / current_rv
+        
+        if iv_rv_ratio < 0.9:
+            assessment = "CHEAP"
+            color = "green"
+            message = "Options cheaper than realized movement"
+        elif iv_rv_ratio > 1.2:
+            assessment = "EXPENSIVE"
+            color = "red"
+            message = "Options expensive"
+        else:
+            assessment = "FAIR"
+            color = "yellow"
+            message = "Options fairly priced"
+        
+        return {
+            "current": {
+                "implied_vol": round(current_iv, 2),
+                "realized_vol": round(current_rv, 2),
+                "iv_rv_ratio": round(iv_rv_ratio, 2),
+                "assessment": assessment,
+                "color": color,
+                "message": message
+            },
+            "periods": len(data),
+            "data": data
+        }
+    except Exception as e:
+        return {"error": f"Error: {str(e)}"}
+
+
 def get_recommendation(signal: str, iv: float, iv_pct: float) -> str:
-    """Generate trading recommendation"""
     if signal == "BUY_STRADDLE":
-        return f"Buy ATM straddle now. IV at {iv:.1f}% ({iv_pct:.0f}th percentile) - favorable entry!"
+        return f"Buy ATM straddle. IV at {iv:.1f}% ({iv_pct:.0f}th percentile)"
     elif signal == "EXIT":
-        return "Exit current position. Target conditions met."
-    elif iv_pct < 30:
-        return f"Watch for entry. IV at {iv_pct:.0f}th percentile - approaching entry zone."
-    else:
-        return f"Wait. IV at {iv_pct:.0f}th percentile - not in entry zone yet."
-
-
-def calculate_confidence(iv_percentile: float) -> int:
-    """Calculate confidence score based on IV percentile"""
-    if iv_percentile <= 20:
-        return 85
-    elif iv_percentile <= 25:
-        return 80
-    elif iv_percentile <= 30:
-        return 70
-    elif iv_percentile <= 35:
-        return 60
-    elif iv_percentile <= 40:
-        return 50
-    elif iv_percentile <= 50:
-        return 40
-    elif iv_percentile <= 70:
-        return 30
-    else:
-        return 20
+        return "Exit position. Target met."
+    return f"Wait. IV at {iv_pct:.0f}th percentile"
 
 
 if __name__ == "__main__":
