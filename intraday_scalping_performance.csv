@@ -1,0 +1,2 @@
+total_trades,winning_trades,losing_trades,win_rate,total_net_pnl,total_raw_pnl,total_transaction_costs,avg_net_pnl,avg_win,avg_loss,profit_factor,sharpe_ratio,avg_hold_minutes,cost_impact_pct
+3158,0,3158,0.0,-151134.44,-1163.2,149971.24,-47.86,0,-47.86,0.0,-13.11,5.2,-12893.0
